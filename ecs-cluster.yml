@@ -1,0 +1,381 @@
+---
+### [Change System Name] awsmaster
+## The following CFn stack must be created first in order to be referenced by the ImportValue function.
+## 1. iam-role
+## 2. ${SystemName}-${Environment}-vpc
+## 3. ${SystemName}-${Environment}-rds
+## 4. ${SystemName}-${Environment}-elb
+##
+## Scheduled Action(Scale Out @ Prod): Monday-Friday 07:00(JST)
+## Scheduled Action(Scale In @ Prod): Monday-Friday 23:00(JST)
+## Scheduled Action(Start @ Not Prod): Monday-Friday 07:50(JST)
+## Scheduled Action(Start @ Not Prod): Monday-Friday 22:00(JST)
+##
+## To avoid instability caused by AZ rebalancing, the following command should be executed. The command is not yet supported in CloudFormation.
+## $ aws autoscaling suspend-processes --scaling-processes AZRebalance --auto-scaling-group-name <value>
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create ECS Cluster (EC2 Launch Template and EC2 Auto Scaling Group)
+
+Mappings:
+  EnvironmentMap:
+    prod:
+      AutoScalingDesiredCapacity: 2
+      AutoScalingMinSize: 1
+      AutoScalingMaxSize: 3
+    stg:
+      AutoScalingDesiredCapacity: 2
+      AutoScalingMinSize: 1
+      AutoScalingMaxSize: 3
+    dev:
+      AutoScalingDesiredCapacity: 1
+      AutoScalingMinSize: 1
+      AutoScalingMaxSize: 3
+
+Parameters:
+  SystemName:
+    Description: System Name
+    Type: String
+    Default: awsmaster ### [Change System Name]
+  Environment:
+    Description: Environment
+    Type: String
+    Default: prod
+    AllowedValues:
+      - prod
+      - stg
+      - dev
+  ResourceName:
+    Description: Resource Name
+    Type: String
+    Default: viacdn
+  EC2ImageId:
+    Description: >
+      Specifies the AMI ID for your container instances.
+      https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+      https://ap-northeast-1.console.aws.amazon.com/systems-manager/parameters/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/description
+      e.g. al2023-ami-ecs-hvm-2023.0.20240109-kernel-6.1-x86_64
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+  UseSubnetProtected:
+    Description: Use Protected Subnet
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - SystemName
+          - Environment
+          - ResourceName
+          - EC2ImageId
+          - UseSubnetProtected
+
+Conditions:
+  isProd: !Equals [ !Ref Environment, prod ]
+  isNotProd: !Not [ !Equals [ !Ref Environment, prod ] ]
+  ShouldUseSubnetProtected: !Equals [ !Ref UseSubnetProtected, false ]
+
+Resources:
+  ## ECS: Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster
+
+  ## EC2(VPC): Security Group
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-sg
+      GroupDescription: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-sg
+      VpcId:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-sg
+
+  ## EC2(VPC): Security Group Inbound Rule From ELB (HTTP)
+  EC2SecurityGroupIngressHttpFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 32768 ## Ref. https://docs.aws.amazon.com/ja_jp/AmazonECS/latest/developerguide/task_definition_parameters.html
+      ToPort: 65535
+      SourceSecurityGroupId:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-elb-EC2SecurityGroup
+      Description: !Sub ${SystemName}-${Environment}-alb-sg
+
+  ## EC2(VPC): Security Group Inbound Rule To RDS (MySQL)
+  EC2SecurityGroupIngressMySQLToRDS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-DBClusterEndpointPort
+      ToPort:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-DBClusterEndpointPort
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Description: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-sg
+
+  ## EC2: Launch Template
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-lt
+      LaunchTemplateData:
+        ImageId: !Ref EC2ImageId
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            Description: Primary network interface
+            AssociatePublicIpAddress: !If [ ShouldUseSubnetProtected, false, true ]
+            Groups:
+              - !Ref EC2SecurityGroup
+        ## In Amazon Linux 2, gp2 was the default and I had to specify to change to gp3.
+        ## But in Amazon Linux 2023, gp3 is now the default, so I no longer need to specify.
+        # BlockDeviceMappings:
+        #   - DeviceName: /dev/xvda
+        #     Ebs:
+        #       VolumeSize: 30
+        #       VolumeType: gp3
+        #       # Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-asg
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-asg
+        IamInstanceProfile:
+          Name: !ImportValue iam-role-AmazonSSMManagedECSInstanceProfile
+        InstanceInitiatedShutdownBehavior: terminate
+        Monitoring:
+          Enabled: false
+        # EbsOptimized: true ## EbsOptimized is not available for t2 instance type.
+        MetadataOptions:
+          HttpTokens: required ## V2 only (token required)
+          HttpPutResponseHopLimit: 2 ## 2 if you need to access the metadata from a Docker container on EC2, 1 if you don't.
+          InstanceMetadataTags: disabled
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            ## Ref. https://docs.aws.amazon.com/ja_jp/AmazonECS/latest/developerguide/ecs-agent-config.html
+            echo ECS_CLUSTER=${SystemName}-${Environment}-${ResourceName}-ecs-cluster >> /etc/ecs/ecs.config;
+            echo ECS_ENABLE_SPOT_INSTANCE_DRAINING=true >> /etc/ecs/ecs.config;
+            echo ECS_LOG_MAX_ROLL_COUNT=168 >> /etc/ecs/ecs.config;
+
+  ## Auto Scaling: Auto Scaling Group
+  EC2AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    ## By defining DependsOn, EC2AutoScalingGroup is created after Cluster.
+    ## However, the order in which they are created is not a problem;
+    ## it is a problem if the Cluster is deleted before the EC2AutoScalingGroup,
+    ## so DependsOn is defined.
+    DependsOn: Cluster
+    ## If you don't want CloudFormation to change any of the group size property values
+    ## when you have a scheduled action in effect, use the AutoScalingScheduledAction update policy
+    ## and set IgnoreUnmodifiedGroupSizeProperties to true to prevent CloudFormation
+    ## from changing the MinSize, MaxSize, or DesiredCapacity properties
+    ## unless you have modified these values in your template.
+    ## For Japanese translation, please refer to the following.
+    ## Ref. https://docs.aws.amazon.com/ja_jp/AWSCloudFormation/latest/UserGuide/aws-attribute-updatepolicy.html
+    ## >> IgnoreUnmodifiedGroupSizeProperties
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: true
+    Properties:
+      AutoScalingGroupName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-ec2-asg
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref EC2LaunchTemplate
+            Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+          Overrides:
+            ## Since the Memory is the same below, WeightedCapacity is not specified.
+            - InstanceType: t2.micro
+            - InstanceType: t3a.micro
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: price-capacity-optimized
+          # SpotInstancePools: 4 ## Valid only when the Spot allocation strategy is lowest-price.
+      CapacityRebalance: true
+      VPCZoneIdentifier:
+        Fn::If:
+          - ShouldUseSubnetProtected
+          - - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetProtectedA
+            - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetProtectedC
+            - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetProtectedD
+          - - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPublicA
+            - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPublicC
+            - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPublicD
+      HealthCheckType: EBS
+      HealthCheckGracePeriod: 300
+      DesiredCapacity: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingDesiredCapacity ]
+      MinSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMinSize ]
+      MaxSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMaxSize ]
+
+  ## Auto Scaling: Scheduled Action (Scale Out)
+  ScheduledActionScaleOut:
+    Condition: isProd
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref EC2AutoScalingGroup
+      DesiredCapacity: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingDesiredCapacity ]
+      MinSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMinSize ]
+      MaxSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMaxSize ]
+      Recurrence: "0 22 * * SUN-THU" ## [Cron] Monday-Friday 07:00(JST) @ Prod
+
+  ## Auto Scaling: Scheduled Action (Scale In)
+  ScheduledActionScaleIn:
+    Condition: isProd
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref EC2AutoScalingGroup
+      DesiredCapacity: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMinSize ]
+      MinSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMinSize ]
+      MaxSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMaxSize ]
+      Recurrence: "0 14 * * MON-FRI" ## [Cron] Monday-Friday 23:00(JST) @ Prod
+
+  ## Auto Scaling: Scheduled Action (Start)
+  ScheduledActionStart:
+    Condition: isNotProd
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref EC2AutoScalingGroup
+      DesiredCapacity: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingDesiredCapacity ]
+      MinSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMinSize ]
+      MaxSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMaxSize ]
+      Recurrence: "50 22 * * SUN-THU" ## [Cron] Monday-Friday 07:50(JST) @ Not Prod
+
+  ## Auto Scaling: Scheduled Action (Stop)
+  ScheduledActionStop:
+    Condition: isNotProd
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref EC2AutoScalingGroup
+      DesiredCapacity: 0
+      MinSize: 0
+      MaxSize: !FindInMap [ EnvironmentMap, !Ref Environment, AutoScalingMaxSize ]
+      Recurrence: "0 13 * * MON-FRI" ## [Cron] Monday-Friday 22:00(JST) @ Not Prod
+
+  ## ECS: CapacityProvider
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      ## If a name is specified, it cannot start with aws, ecs, or fargate.
+      Name: !Sub cp-${EC2AutoScalingGroup}
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref EC2AutoScalingGroup
+        ManagedDraining: ENABLED
+        # ManagedScaling:
+        #   Status: ENABLED
+        #   TargetCapacity: 100
+        # ManagedTerminationProtection: DISABLED
+
+  ## ECS: ClusterCapacityProviderAssociations
+  ClusterCapacityProviderAssociations:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders:
+        - !Ref CapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Base: 0
+          Weight: 1
+
+Outputs:
+  ## ECS: Cluster
+  Cluster:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${AWS::StackName}-Cluster
+
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterArn
+
+  ## EC2(VPC): Security Group
+  EC2SecurityGroup:
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2SecurityGroup
+
+  EC2SecurityGroupVpcId:
+    Value: !GetAtt EC2SecurityGroup.VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2SecurityGroupVpcId
+
+  ## EC2: Launch Template
+  EC2LaunchTemplate:
+    Value: !Ref EC2LaunchTemplate
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2LaunchTemplate
+
+  EC2LaunchTemplateDefaultVersionNumber:
+    Value: !GetAtt EC2LaunchTemplate.DefaultVersionNumber
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2LaunchTemplateDefaultVersionNumber
+
+  EC2LaunchTemplateLatestVersionNumber:
+    Value: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2LaunchTemplateLatestVersionNumber
+
+  ## Auto Scaling: Auto Scaling Group
+  EC2AutoScalingGroup:
+    Value: !Ref EC2AutoScalingGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2AutoScalingGroup
+
+  ## Auto Scaling: Scheduled Action (Scale Out)
+  ScheduledActionScaleOut:
+    Condition: isProd
+    Value: !Ref ScheduledActionScaleOut
+    Export:
+      Name: !Sub ${AWS::StackName}-ScheduledActionScaleOut
+
+  ## Auto Scaling: Scheduled Action (Scale In)
+  ScheduledActionScaleIn:
+    Condition: isProd
+    Value: !Ref ScheduledActionScaleIn
+    Export:
+      Name: !Sub ${AWS::StackName}-ScheduledActionScaleIn
+
+  ## Auto Scaling: Scheduled Action (Start)
+  ScheduledActionStart:
+    Condition: isNotProd
+    Value: !Ref ScheduledActionStart
+    Export:
+      Name: !Sub ${AWS::StackName}-ScheduledActionStart
+
+  ## Auto Scaling: Scheduled Action (Stop)
+  ScheduledActionStop:
+    Condition: isNotProd
+    Value: !Ref ScheduledActionStop
+    Export:
+      Name: !Sub ${AWS::StackName}-ScheduledActionStop
+
+  ## ECS: CapacityProvider
+  CapacityProvider:
+    Value: !Ref CapacityProvider
+    Export:
+      Name: !Sub ${AWS::StackName}-CapacityProvider
+
+  ## ECS: ClusterCapacityProviderAssociations
+  ClusterCapacityProviderAssociations:
+    Value: !Ref ClusterCapacityProviderAssociations
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterCapacityProviderAssociations

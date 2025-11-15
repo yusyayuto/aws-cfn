@@ -1,0 +1,37 @@
+---
+### [Change Name] TestUser, TestUser
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create IAM User etc.
+
+Resources:
+  ## IAM: Group
+  GroupAdministrators:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: Administrators
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  ## IAM: User
+  TestUser: ### [Change Name]
+    Type: AWS::IAM::User
+    Properties:
+      UserName: TestUser ### [Change Name]
+      LoginProfile:
+        Password: 123456=NuFuA
+        PasswordResetRequired: true
+      Groups:
+        - !Ref GroupAdministrators
+
+Outputs:
+  ## IAM: Group
+  GroupAdministrators:
+    Value: !GetAtt GroupAdministrators.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-GroupAdministrators
+
+  ## IAM: User
+  TestUser: ### [Change Name]
+    Value: !GetAtt TestUser.Arn ### [Change Name]
+    Export:
+      Name: !Sub ${AWS::StackName}-TestUser ### [Change Name]

@@ -1,0 +1,370 @@
+---
+### [Change System Name] awsmaster
+## The following CFn stack must be created first in order to be referenced by the ImportValue function.
+## 1. iam-role
+## 2. ${SystemName}-${Environment}-route53
+## 3. ${SystemName}-${Environment}-vpc
+## 4. ${SystemName}-${Environment}-rds
+## 5. ${SystemName}-${Environment}-elb
+## 6. ${SystemName}-${Environment}-cloudfront
+## 7. ${SystemName}-${Environment}-ecr
+## 8. ${SystemName}-${Environment}-${ResourceName}-ecs-cluster
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create IAM Policy, IAM Role, SSM Parameter, ELB Target Group, ELB Listener Rule, ECS Task Definition and ECS Service (EC2) etc.
+
+Mappings:
+  EnvironmentMap:
+    prod:
+      ServiceDesiredCount: 2
+    stg:
+      ServiceDesiredCount: 2
+    dev:
+      ServiceDesiredCount: 1
+
+Parameters:
+  SystemName:
+    Description: System Name
+    Type: String
+    Default: awsmaster ### [Change System Name]
+  Environment:
+    Description: Environment
+    Type: String
+    Default: prod
+    AllowedValues:
+      - prod
+      - stg
+      - dev
+  ResourceName:
+    Description: Resource Name
+    Type: String
+    Default: viacdn
+  ELBListenerRulePriority:
+    Description: ELB Listner Rule Priority
+    Type: Number
+    Default: 121
+    MinValue: 1
+    MaxValue: 50000
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - SystemName
+          - Environment
+          - ResourceName
+          - ELBListenerRulePriority
+
+Resources:
+  ## IAM: Role
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        ## To use ECS Exec
+        - !ImportValue iam-role-AmazonECSExecuteCommandPolicy
+      Policies:
+        - PolicyName: AmazonS3StaticContentsManipulateObjectPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::ImportValue: !Sub ${SystemName}-${Environment}-cloudfront-S3BucketStaticContentsArn
+              - Effect: Allow
+                Action: "s3:*Object"
+                Resource: !Sub
+                    - ${S3BucketArn}/*
+                    - S3BucketArn:
+                        Fn::ImportValue: !Sub ${SystemName}-${Environment}-cloudfront-S3BucketStaticContentsArn
+
+  ## ELB: Target Group
+  ELBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${SystemName}-${Environment}-${ResourceName}-tg
+      TargetType: instance
+      Protocol: HTTP
+      Port: 80
+      VpcId:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-VPC
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckPort: traffic-port
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      Matcher:
+        HttpCode: "200,301"
+      TargetGroupAttributes:
+        ## Spot instances are interrupted after 120 seconds, and the default Stop Timeout is 30 seconds.
+        ## We've set this to 75 seconds for a safe margin.
+        ## Ref. https://aws.amazon.com/jp/blogs/containers/graceful-shutdowns-with-ecs/
+        - Key: deregistration_delay.timeout_seconds
+          Value: 75
+
+  ## ELB: Listener Rule
+  ELBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-elb-ListenerHttps
+      Priority: !Ref ELBListenerRulePriority
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: x-via-cloudfront
+            Values:
+              - !Sub
+                  - "{{resolve:secretsmanager:${SecretForCloudFront}:SecretString:x-via-cloudfront}}"
+                  - SecretForCloudFront:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-cloudfront-SecretForCloudFront
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /users
+              - /users/*
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref ELBTargetGroup
+
+  ## Logs: Log Group
+  LogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${SystemName}-${Environment}-${ResourceName}-ecs-task
+
+  ## SSM: Parameter
+  SSMParameterAppRailsEnv:
+    Type: AWS::SSM::Parameter
+    Properties:
+      ## For some reason, I couldn't put awsmaster at the beginning. It seems to be reserved.
+      Name: !Sub /${Environment}/${SystemName}/${ResourceName}/ecs/environment/app/rails-env
+      Type: String
+      Value: development
+
+  ## ECS: Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-task
+      RequiresCompatibilities:
+        - EC2
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      NetworkMode: bridge
+      TaskRoleArn: !GetAtt IAMRole.Arn
+      ExecutionRoleArn: !ImportValue iam-role-AmazonECSTaskExecutionRoleArn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+              - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+              - ECRRepository:
+                  Fn::ImportValue: !Sub ${SystemName}-${Environment}-ecr-ECRRepositoryApp
+          Essential: true
+          Cpu: 0
+          MemoryReservation: 80
+          Secrets:
+            - Name: MYSQL_HOST
+              ValueFrom: !Sub
+                  - "${SecretForRDSAwsmaster}:host::"
+                  - SecretForRDSAwsmaster:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-SecretForRDSAwsmaster
+            - Name: MYSQL_DATABASE
+              ValueFrom: !Sub
+                  - "${SecretForRDSAwsmaster}:database::"
+                  - SecretForRDSAwsmaster:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-SecretForRDSAwsmaster
+            - Name: MYSQL_USER
+              ValueFrom: !Sub
+                  - "${SecretForRDSAwsmaster}:username::"
+                  - SecretForRDSAwsmaster:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-SecretForRDSAwsmaster
+            - Name: MYSQL_PASSWORD
+              ValueFrom: !Sub
+                  - "${SecretForRDSAwsmaster}:password::"
+                  - SecretForRDSAwsmaster:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-rds-SecretForRDSAwsmaster
+            - Name: RAILS_ENV
+              ValueFrom: !Ref SSMParameterAppRailsEnv
+          Environment:
+            - Name: RAILS_CONFIG_HOSTS
+              Value: !Sub
+                  - ".${DomainName}" ## Include subdomains.
+                  - DomainName:
+                      Fn::ImportValue: !Sub ${SystemName}-${Environment}-route53-HostedZoneDomainName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "curl -f http://127.0.0.1:3000/ || exit 1"
+            StartPeriod: 180
+          LinuxParameters:
+            InitProcessEnabled: true
+        - Name: web
+          Image: !Sub
+              - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+              - ECRRepository:
+                  Fn::ImportValue: !Sub ${SystemName}-${Environment}-ecr-ECRRepositoryWeb
+          Essential: true
+          PortMappings:
+            - HostPort: 0
+              ContainerPort: 80
+              Protocol: tcp
+          Cpu: 0
+          MemoryReservation: 16
+          Environment:
+            - Name: NGINX_BACKEND
+              Value: app
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+          DependsOn:
+            - ContainerName: app
+              Condition: HEALTHY
+          Links: ## Available only when "NetworkMode: bridge"
+            - app
+          Command:
+            - /bin/bash
+            - -c
+            - "envsubst '$$NGINX_BACKEND' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+          LinuxParameters:
+            InitProcessEnabled: true
+
+  ## ECS: Service
+  Service:
+    Type: AWS::ECS::Service
+    ## The target group that has not been associated with the load balancer cannot be used with the ECS Service.
+    ## Therefore, you need to create a listener rule first to associate the load balancer with the target group.
+    DependsOn: ELBListenerRule
+    Properties:
+      ServiceName: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-service
+      Cluster:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-Cluster
+      CapacityProviderStrategy:
+        - CapacityProvider:
+            Fn::ImportValue: !Sub ${SystemName}-${Environment}-${ResourceName}-ecs-cluster-CapacityProvider
+          Base: 0
+          Weight: 1
+      TaskDefinition: !Ref TaskDefinition
+      SchedulingStrategy: REPLICA
+      DesiredCount: !FindInMap [ EnvironmentMap, !Ref Environment, ServiceDesiredCount ]
+      AvailabilityZoneRebalancing: ENABLED
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 80
+          TargetGroupArn: !Ref ELBTargetGroup
+      HealthCheckGracePeriodSeconds: 300
+      PlacementStrategies:
+        - Field: attribute:ecs.availability-zone
+          Type: spread
+        - Field: instanceId
+          Type: spread
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+
+Outputs:
+  ## IAM: Role
+  IAMRole:
+    Value: !Ref IAMRole
+    Export:
+      Name: !Sub ${AWS::StackName}-IAMRole
+
+  IAMRoleArn:
+    Value: !GetAtt IAMRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-IAMRoleArn
+
+  ## ELB: Target Group
+  ELBTargetGroup:
+    Value: !Ref ELBTargetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-ELBTargetGroup
+
+  ELBTargetGroupLoadBalancerArns1:
+    Value: !Select [ 0, !GetAtt ELBTargetGroup.LoadBalancerArns ]
+    Export:
+      Name: !Sub ${AWS::StackName}-ELBTargetGroupLoadBalancerArns1
+
+  ELBTargetGroupFullName:
+    Value: !GetAtt ELBTargetGroup.TargetGroupFullName
+    Export:
+      Name: !Sub ${AWS::StackName}-ELBTargetGroupFullName
+
+  ELBTargetGroupName:
+    Value: !GetAtt ELBTargetGroup.TargetGroupName
+    Export:
+      Name: !Sub ${AWS::StackName}-ELBTargetGroupName
+
+  ## ELB: Listener Rule
+  ELBListenerRule:
+    Value: !Ref ELBListenerRule
+    Export:
+      Name: !Sub ${AWS::StackName}-ELBListenerRule
+
+  ## Logs: Log Group
+  LogsLogGroup:
+    Value: !Ref LogsLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsLogGroup
+
+  LogsLogGroupArn:
+    Value: !GetAtt LogsLogGroup.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsLogGroupArn
+
+  ## SSM: Parameter
+  SSMParameterAppRailsEnv:
+    Value: !Ref SSMParameterAppRailsEnv
+    Export:
+      Name: !Sub ${AWS::StackName}-SSMParameterAppRailsEnv
+
+  ## ECS: Task Definition
+  TaskDefinition:
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${AWS::StackName}-TaskDefinition
+
+  ## ECS: Service
+  Service:
+    Value: !Ref Service
+    Export:
+      Name: !Sub ${AWS::StackName}-Service
+
+  ServiceName:
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub ${AWS::StackName}-ServiceName

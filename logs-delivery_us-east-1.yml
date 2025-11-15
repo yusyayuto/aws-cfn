@@ -1,0 +1,157 @@
+---
+## **** This CFn stack must be created in the us-east-1 region ****
+### [Change CloudFront Distribution Id] [xxxxxxxxxxxxx]
+### [Change System Name] awsmaster
+## The following CFn stack must be created first since the Distribution Id value is required.
+## 1. ${SystemName}-${Environment}-cloudfront
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create Logs Delivery for CloudFront etc.
+
+Mappings:
+  EnvironmentMap:
+    prod:
+      ### [Change CloudFront Distribution Id] Logs Delivery Source needs to be created in the us-east-1 region.
+      CloudFrontDistributionId: E1OIXWGY39Y7KP
+    stg:
+      CloudFrontDistributionId: [xxxxxxxxxxxxx]
+    dev:
+      CloudFrontDistributionId: [xxxxxxxxxxxxx]
+
+Parameters:
+  SystemName:
+    Description: System Name
+    Type: String
+    Default: awsmaster ### [Change System Name]
+  Environment:
+    Description: Environment
+    Type: String
+    Default: prod
+    AllowedValues:
+      - prod
+      - stg
+      - dev
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - SystemName
+          - Environment
+
+Resources:
+  ## Logs: Delivery Source
+  LogsDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub ${SystemName}-${Environment}-cloudfront-delivery-source
+      ResourceArn: !Sub
+          - arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistributionId}
+          - DistributionId:
+              !FindInMap [ EnvironmentMap, !Ref Environment, CloudFrontDistributionId ]
+      LogType: ACCESS_LOGS
+
+  ## Logs: Delivery Destination
+    ## You should include AWSLogs at the end of the DestinationResourceArn. Refer to the URL below for details.
+  ## Ref. https://dev.classmethod.jp/articles/cloudfront-standard-log-v2-prefix-suffix-relationship/
+  LogsDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub ${SystemName}-${Environment}-cloudfront-delivery-destination
+      DestinationResourceArn: !Sub arn:aws:s3:::${SystemName}-${Environment}-cloudfront-accesslogs-${AWS::AccountId}/AWSLogs
+      OutputFormat: json
+
+  ## Logs: Delivery
+  LogsDelivery:
+    Type: AWS::Logs::Delivery
+    ## To ensure that LogsDelivery is deleted first before LogsDeliverySource is deleted
+    DependsOn: LogsDeliverySource
+    Properties:
+      DeliverySourceName: !Sub ${SystemName}-${Environment}-cloudfront-delivery-source
+      DeliveryDestinationArn: !GetAtt LogsDeliveryDestination.Arn
+      RecordFields:
+        - timestamp
+        - DistributionId
+        - date
+        - time
+        - x-edge-location
+        - sc-bytes
+        - c-ip
+        - cs-method
+        - cs(Host)
+        - cs-uri-stem
+        - sc-status
+        - cs(Referer)
+        - cs(User-Agent)
+        - cs-uri-query
+        - cs(Cookie)
+        - x-edge-result-type
+        - x-edge-request-id
+        - x-host-header
+        - cs-protocol
+        - cs-bytes
+        - time-taken
+        - x-forwarded-for
+        - ssl-protocol
+        - ssl-cipher
+        - x-edge-response-result-type
+        - cs-protocol-version
+        - fle-status
+        - fle-encrypted-fields
+        - c-port
+        - time-to-first-byte
+        - x-edge-detailed-result-type
+        - sc-content-type
+        - sc-content-len
+        - sc-range-start
+        - sc-range-end
+        - timestamp(ms)
+        - origin-fbl
+        - origin-lbl
+        - asn
+        - c-country
+        - cache-behavior-path-pattern
+        - distributionid
+        - distribution-tenant-id
+      S3SuffixPath: !Sub ${AWS::AccountId}/CloudFront/{yyyy}/{MM}/{dd}/{HH}
+      S3EnableHiveCompatiblePath: false
+
+Outputs:
+  ## Logs: Delivery Source
+  LogsDeliverySourceArn:
+    Value: !GetAtt LogsDeliverySource.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliverySourceArn
+
+  LogsDeliverySourceResourceArn1:
+    Value: !Select [ 0, !GetAtt LogsDeliverySource.ResourceArns ]
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliverySourceResourceArn1
+
+  LogsDeliverySourceService:
+    Value: !GetAtt LogsDeliverySource.Service
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliverySourceService
+
+  ## Logs: Delivery Destination
+  LogsDeliveryDestination:
+    Value: !GetAtt LogsDeliveryDestination.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliveryDestinationArn
+
+  ## Logs: Delivery
+  LogsDeliveryArn:
+    Value: !GetAtt LogsDelivery.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliveryArn
+
+  LogsDeliveryDestinationType:
+    Value: !GetAtt LogsDelivery.DeliveryDestinationType
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliveryDestinationType
+
+  LogsDeliveryId:
+    Value: !GetAtt LogsDelivery.DeliveryId
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsDeliveryId

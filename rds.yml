@@ -1,0 +1,359 @@
+---
+### [Change System Name] awsmaster
+## The following CFn stack must be created first in order to be referenced by the ImportValue function.
+## 1. iam-role
+## 2. ${SystemName}-${Environment}-vpc
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create RDS DB Cluster etc.
+
+Mappings:
+  EnvironmentMap:
+    prod:
+      DBInstanceClass: db.t4g.medium
+      CreateDBInstanceC: false
+      CreateDBInstanceD: false
+      EnhancedMonitoring: false
+      BackupRetentionPeriod: 3
+    stg:
+      DBInstanceClass: db.t4g.medium
+      CreateDBInstanceC: false
+      CreateDBInstanceD: false
+      EnhancedMonitoring: false
+      BackupRetentionPeriod: 1
+    dev:
+      DBInstanceClass: db.t4g.medium
+      CreateDBInstanceC: false
+      CreateDBInstanceD: false
+      EnhancedMonitoring: false
+      BackupRetentionPeriod: 1
+  SystemNameMap:
+    awsmaster: ### [Change System Name]
+      Engine: aurora-mysql
+      ParameterGroupFamily: aurora-mysql8.0
+      EngineVersion: 8.0.mysql_aurora.3.05.2
+      PreferredBackupWindow: 16:15-16:45
+      PreferredMaintenanceWindowCluster: tue:16:45-tue:17:15
+      PreferredMaintenanceWindowInstanceA: tue:17:15-tue:17:45
+      PreferredMaintenanceWindowInstanceC: tue:17:45-tue:18:15
+      PreferredMaintenanceWindowInstanceD: tue:18:15-tue:18:45
+
+Parameters:
+  SystemName:
+    Description: System Name
+    Type: String
+    Default: awsmaster ### [Change System Name]
+  Environment:
+    Description: Environment
+    Type: String
+    Default: prod
+    AllowedValues:
+      - prod
+      - stg
+      - dev
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - SystemName
+          - Environment
+
+Conditions:
+  ShouldCreateDBInstanceC: !Equals [ !FindInMap [ EnvironmentMap, !Ref Environment, CreateDBInstanceC ], true ]
+  ShouldCreateDBInstanceD: !Equals [ !FindInMap [ EnvironmentMap, !Ref Environment, CreateDBInstanceD ], true ]
+  EnabledEnhancedMonitoring: !Equals [ !FindInMap [ EnvironmentMap, !Ref Environment, EnhancedMonitoring ], true ]
+
+Resources:
+  ## Secrets Manager: Secret (root)
+  SecretForRDS:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub Secret for RDS (Master user (root) of ${AWS::StackName})
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "root"}'
+        GenerateStringKey: password
+        ExcludePunctuation: true
+        PasswordLength: 32
+
+  ## Secrets Manager: Secret (${SystemName})
+  SecretForRDSAwsmaster:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub Secret for RDS (User ${SystemName} of ${AWS::StackName})
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"database": "${SystemName}", "username": "${SystemName}"}'
+        GenerateStringKey: password
+        ExcludePunctuation: true
+        PasswordLength: 32
+
+  ## EC2(VPC): Security Group
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${SystemName}-${Environment}-rds-sg
+      GroupDescription: !Sub ${SystemName}-${Environment}-rds-sg
+      VpcId:
+        Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${SystemName}-${Environment}-rds-sg
+
+  ## RDS: DB Cluster Parameter Group
+  DBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Sub ${SystemName}-${Environment}-rds-cluster-pg
+      Family: !FindInMap [ SystemNameMap, !Ref SystemName, ParameterGroupFamily ]
+      Parameters:
+        require_secure_transport: "ON" ## SSL required
+
+  ## RDS: DB Parameter Group
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${SystemName}-${Environment}-rds-pg
+      Family: !FindInMap [ SystemNameMap, !Ref SystemName, ParameterGroupFamily ]
+
+  ## RDS: DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${SystemName}-${Environment}-rds-subgrp
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPrivateA
+        - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPrivateC
+        - Fn::ImportValue: !Sub ${SystemName}-${Environment}-vpc-SubnetPrivateD
+
+  ## RDS: DB Cluster
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub ${SystemName}-${Environment}-rds
+      Engine: !FindInMap [ SystemNameMap, !Ref SystemName, Engine ]
+      EngineMode: provisioned
+      EngineVersion: !FindInMap [ SystemNameMap, !Ref SystemName, EngineVersion ]
+      MasterUsername: !Sub "{{resolve:secretsmanager:${SecretForRDS}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${SecretForRDS}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      AvailabilityZones:
+        - !Sub ${AWS::Region}a
+        - !Sub ${AWS::Region}c
+        - !Sub ${AWS::Region}d
+      VpcSecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      Port: 3306 ## Aurora MySQL = 3306 / Aurora PostgreSQL = 5432
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      PreferredMaintenanceWindow: !FindInMap [ SystemNameMap, !Ref SystemName, PreferredMaintenanceWindowCluster ]
+      PreferredBackupWindow: !FindInMap [ SystemNameMap, !Ref SystemName, PreferredBackupWindow ]
+      BackupRetentionPeriod: !FindInMap [ EnvironmentMap, !Ref Environment, BackupRetentionPeriod ]
+      CopyTagsToSnapshot: true
+      StorageEncrypted: true
+      EnableCloudwatchLogsExports:
+        - audit
+        - error
+        - general
+        - slowquery
+      DeletionProtection: true
+
+  ## RDS: DB Instance @ Private-A
+  DBInstanceA:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      PromotionTier: 1
+      AvailabilityZone: !Sub ${AWS::Region}a
+      PubliclyAccessible: false
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: !FindInMap [ SystemNameMap, !Ref SystemName, Engine ]
+      DBInstanceClass: !FindInMap [ EnvironmentMap, !Ref Environment, DBInstanceClass ]
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      DBParameterGroupName: !Ref DBParameterGroup
+      PreferredMaintenanceWindow: !FindInMap [ SystemNameMap, !Ref SystemName, PreferredMaintenanceWindowInstanceA ]
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: false ## Not suported on Aurora MySQL db.t3/t4g instance classes.
+      MonitoringInterval: !If [ EnabledEnhancedMonitoring, 60, 0 ]
+      MonitoringRoleArn: !If [ EnabledEnhancedMonitoring, !ImportValue iam-role-AmazonRDSEnhancedMonitoringRoleArn, !Ref AWS::NoValue ]
+
+  ## RDS: DB Instance @ Private-C
+  DBInstanceC:
+    Condition: ShouldCreateDBInstanceC
+    Type: AWS::RDS::DBInstance
+    Properties:
+      PromotionTier: 2
+      AvailabilityZone: !Sub ${AWS::Region}c
+      PubliclyAccessible: false
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: !FindInMap [ SystemNameMap, !Ref SystemName, Engine ]
+      DBInstanceClass: !FindInMap [ EnvironmentMap, !Ref Environment, DBInstanceClass ]
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      DBParameterGroupName: !Ref DBParameterGroup
+      PreferredMaintenanceWindow: !FindInMap [ SystemNameMap, !Ref SystemName, PreferredMaintenanceWindowInstanceC ]
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: false ## Not suported on Aurora MySQL db.t3/t4g instance classes.
+      MonitoringInterval: !If [ EnabledEnhancedMonitoring, 60, 0 ]
+      MonitoringRoleArn: !If [ EnabledEnhancedMonitoring, !ImportValue iam-role-AmazonRDSEnhancedMonitoringRoleArn, !Ref AWS::NoValue ]
+
+  ## RDS: DB Instance @ Private-D
+  DBInstanceD:
+    Condition: ShouldCreateDBInstanceD
+    Type: AWS::RDS::DBInstance
+    Properties:
+      PromotionTier: 3
+      AvailabilityZone: !Sub ${AWS::Region}d
+      PubliclyAccessible: false
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: !FindInMap [ SystemNameMap, !Ref SystemName, Engine ]
+      DBInstanceClass: !FindInMap [ EnvironmentMap, !Ref Environment, DBInstanceClass ]
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      DBParameterGroupName: !Ref DBParameterGroup
+      PreferredMaintenanceWindow: !FindInMap [ SystemNameMap, !Ref SystemName, PreferredMaintenanceWindowInstanceD ]
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: false ## Not suported on Aurora MySQL db.t3/t4g instance classes.
+      MonitoringInterval: !If [ EnabledEnhancedMonitoring, 60, 0 ]
+      MonitoringRoleArn: !If [ EnabledEnhancedMonitoring, !ImportValue iam-role-AmazonRDSEnhancedMonitoringRoleArn, !Ref AWS::NoValue ]
+
+  ## Secrets Manager: Secret Target Attachment (root)
+  SecretTargetAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref SecretForRDS
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  ## Secrets Manager: Secret Target Attachment (${SystemName})
+  SecretTargetAttachmentAwsmaster:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref SecretForRDSAwsmaster
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+Outputs:
+  ## Secrets Manager: Secret (root)
+  SecretForRDS:
+    Value: !Ref SecretForRDS
+    Export:
+      Name: !Sub ${AWS::StackName}-SecretForRDS
+
+  ## Secrets Manager: Secret (${SystemName})
+  SecretForRDSAwsmaster:
+    Value: !Ref SecretForRDSAwsmaster
+    Export:
+      Name: !Sub ${AWS::StackName}-SecretForRDSAwsmaster
+
+  ## EC2(VPC): Security Group
+  EC2SecurityGroup:
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2SecurityGroup
+
+  EC2SecurityGroupVpcId:
+    Value: !GetAtt EC2SecurityGroup.VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2SecurityGroupVpcId
+
+  ## RDS: DB Cluster Parameter Group
+  DBClusterParameterGroup:
+    Value: !Ref DBClusterParameterGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DBClusterParameterGroup
+
+  ## RDS: DB Parameter Group
+  DBParameterGroup:
+    Value: !Ref DBParameterGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DBParameterGroup
+
+  ## RDS: DB Subnet Group
+  DBSubnetGroup:
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DBSubnetGroup
+
+  ## RDS: DB Cluster
+  DBCluster:
+    Value: !Ref DBCluster
+    Export:
+      Name: !Sub ${AWS::StackName}-DBCluster
+
+  DBClusterEndpointAddress:
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DBClusterEndpointAddress
+
+  DBClusterEndpointPort:
+    Value: !GetAtt DBCluster.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DBClusterEndpointPort
+
+  DBClusterReadEndpointAddress:
+    Value: !GetAtt DBCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DBClusterReadEndpointAddress
+
+  ## RDS: DB Instance @ Private-A
+  DBInstanceA:
+    Value: !Ref DBInstanceA
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceA
+
+  DBInstanceAEndpointAddress:
+    Value: !GetAtt DBInstanceA.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceAEndpointAddress
+
+  DBInstanceAEndpointPort:
+    Value: !GetAtt DBInstanceA.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceAEndpointPort
+
+  ## RDS: DB Instance @ Private-C
+  DBInstanceC:
+    Condition: ShouldCreateDBInstanceC
+    Value: !Ref DBInstanceC
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceC
+
+  DBInstanceCEndpointAddress:
+    Condition: ShouldCreateDBInstanceC
+    Value: !GetAtt DBInstanceC.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceCEndpointAddress
+
+  DBInstanceCEndpointPort:
+    Condition: ShouldCreateDBInstanceC
+    Value: !GetAtt DBInstanceC.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceCEndpointPort
+
+  ## RDS: DB Instance @ Private-D
+  DBInstanceD:
+    Condition: ShouldCreateDBInstanceD
+    Value: !Ref DBInstanceD
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceD
+
+  DBInstanceDEndpointAddress:
+    Condition: ShouldCreateDBInstanceD
+    Value: !GetAtt DBInstanceD.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceDEndpointAddress
+
+  DBInstanceDEndpointPort:
+    Condition: ShouldCreateDBInstanceD
+    Value: !GetAtt DBInstanceD.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DBInstanceDEndpointPort
+
+  ## Secrets Manager: Secret Target Attachment (root)
+  SecretTargetAttachment:
+    Value: !Ref SecretTargetAttachment
+    Export:
+      Name: !Sub ${AWS::StackName}-SecretTargetAttachment
+
+  ## Secrets Manager: Secret Target Attachment (${SystemName})
+  SecretTargetAttachmentAwsmaster:
+    Value: !Ref SecretTargetAttachmentAwsmaster
+    Export:
+      Name: !Sub ${AWS::StackName}-SecretTargetAttachmentAwsmaster
